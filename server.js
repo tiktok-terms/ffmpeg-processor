@@ -10,7 +10,7 @@ app.use(express.json({ limit: "5mb" }));
 
 const PORT = process.env.PORT || 3000;
 const AUTH_TOKEN = process.env.AUTH_TOKEN || "";
-const VERSION = "v5-animated";
+const VERSION = "v6-loopfix";
 
 // Шрифты (устанавливаются в Dockerfile: fonts-dejavu-core / fonts-dejavu-extra)
 const FONT_DIR = "/usr/share/fonts/truetype/dejavu";
@@ -228,6 +228,8 @@ app.post("/render", async (req, res) => {
 
     const args = [
       "-y",
+      "-loop", "1",
+      "-framerate", String(fps),
       "-i", imgPath,
       "-i", musicPath,
       "-map", "0:v:0",
