@@ -10,10 +10,10 @@ app.use(express.json({ limit: "5mb" }));
 
 const PORT = process.env.PORT || 3000;
 const AUTH_TOKEN = process.env.AUTH_TOKEN || "";
+const VERSION = "v3-map-threads"; // маркер версии — виден в /health
 
-// --- Простая проверка токена ---
 function checkAuth(req, res) {
-  if (!AUTH_TOKEN) return true; // если токен не задан — не проверяем (не рекомендуется)
+  if (!AUTH_TOKEN) return true;
   const header = req.get("authorization") || "";
   const token = header.replace(/^Bearer\s+/i, "").trim();
   if (token !== AUTH_TOKEN) {
@@ -23,7 +23,6 @@ function checkAuth(req, res) {
   return true;
 }
 
-// --- Скачать файл по URL во временный путь ---
 async function download(url, filePath) {
   const resp = await fetch(url, { redirect: "follow" });
   if (!resp.ok) {
@@ -33,7 +32,6 @@ async function download(url, filePath) {
   await writeFile(filePath, buf);
 }
 
-// --- Запустить ffmpeg ---
 function runFfmpeg(args) {
   return new Promise((resolve, reject) => {
     const proc = spawn("ffmpeg", args);
@@ -42,17 +40,14 @@ function runFfmpeg(args) {
     proc.on("error", reject);
     proc.on("close", (code) => {
       if (code === 0) resolve();
-      else reject(new Error("ffmpeg failed: " + stderr.slice(-2000)));
+      else reject(new Error("ffmpeg failed (code " + code + "): " + stderr.slice(-4000)));
     });
   });
 }
 
-app.get("/", (_req, res) => res.json({ ok: true, service: "ffmpeg-tiktok" }));
-app.get("/health", (_req, res) => res.json({ ok: true }));
+app.get("/", (_req, res) => res.json({ ok: true, service: "ffmpeg-tiktok", version: VERSION }));
+app.get("/health", (_req, res) => res.json({ ok: true, version: VERSION }));
 
-// --- Основной эндпоинт рендера ---
-// Принимает: { image_url, music_url, width?, height? }
-// Возвращает: mp4-файл (binary) в теле ответа (Content-Type: video/mp4)
 app.post("/render", async (req, res) => {
   if (!checkAuth(req, res)) return;
 
@@ -69,9 +64,8 @@ app.post("/render", async (req, res) => {
   try {
     await Promise.all([download(image_url, imgPath), download(music_url, musicPath)]);
 
-    // Картинка (loop) на весь кадр 1080x1920 + аудио задаёт длительность (-shortest).
-    // -map 0:v:0 берёт картинку как видео, -map 1:a:0 берёт ТОЛЬКО аудиопоток mp3,
-    // игнорируя встроенную обложку (album cover), из-за которой ffmpeg падал.
+    // -map 0:v:0 — картинка как видео; -map 1:a:0 — ТОЛЬКО аудиопоток mp3 (без обложки).
+    // -threads 2 ограничивает память/CPU, чтобы не падать на ограниченном контейнере Railway.
     const args = [
       "-y",
       "-loop", "1",
@@ -81,8 +75,9 @@ app.post("/render", async (req, res) => {
       "-map", "1:a:0",
       "-vf", `scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},format=yuv420p`,
       "-c:v", "libx264",
-      "-preset", "veryfast",
+      "-preset", "ultrafast",
       "-tune", "stillimage",
+      "-threads", "2",
       "-r", "30",
       "-c:a", "aac",
       "-b:a", "192k",
@@ -105,4 +100,4 @@ app.post("/render", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`FFmpeg service listening on ${PORT}`));
+app.listen(PORT, () => console.log(`FFmpeg service ${VERSION} listening on ${PORT}`));
