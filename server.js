@@ -10,7 +10,7 @@ app.use(express.json({ limit: "5mb" }));
 
 const PORT = process.env.PORT || 3000;
 const AUTH_TOKEN = process.env.AUTH_TOKEN || "";
-const VERSION = "v7-threads";
+const VERSION = "v8-fittext";
 
 // Шрифты (устанавливаются в Dockerfile: fonts-dejavu-core / fonts-dejavu-extra)
 const FONT_DIR = "/usr/share/fonts/truetype/dejavu";
@@ -87,6 +87,31 @@ function wrapText(text, maxChars) {
   return lines.length ? lines : [""];
 }
 
+// Средняя ширина глифа относительно кегля (для DejaVu/кириллицы — консервативно)
+const CHAR_W = 0.56;
+
+// --- Подогнать текст в рамку boxW x boxH: перенос по словам + уменьшение шрифта ---
+// Возвращает { size, lines, lineH, blockH } так, чтобы блок гарантированно влез.
+function fitText(text, startSize, minSize, boxW, boxH) {
+  const t = String(text || "").trim();
+  for (let size = startSize; size >= minSize; size -= 2) {
+    const maxChars = Math.max(6, Math.floor(boxW / (size * CHAR_W)));
+    const lines = wrapText(t, maxChars);
+    const lineH = Math.round(size * 1.35);
+    const blockH = lines.length * lineH;
+    const longest = lines.reduce((m, l) => Math.max(m, l.length), 0);
+    const widest = longest * size * CHAR_W;
+    if (blockH <= boxH && widest <= boxW) {
+      return { size, lines, lineH, blockH };
+    }
+  }
+  // Не влезло даже на минимальном кегле — переносим по минимуму.
+  const maxChars = Math.max(6, Math.floor(boxW / (minSize * CHAR_W)));
+  const lines = wrapText(t, maxChars);
+  const lineH = Math.round(minSize * 1.35);
+  return { size: minSize, lines, lineH, blockH: lines.length * lineH };
+}
+
 function clamp(n, min, max, dflt) {
   const v = Number(n);
   if (!isFinite(v)) return dflt;
@@ -134,7 +159,7 @@ app.get("/health", (_req, res) => res.json({ ok: true, version: VERSION }));
 // --- Основной эндпоинт рендера ---
 // Принимает:
 // {
-//   image_url, music_url, width?, height?, max_seconds?,
+//   image_url, music_url, width?, height?, max_seconds?, safe_width?, safe_height?,
 //   quote_text, author,
 //   animation: { type, intensity },
 //   quote_style: { position, font, font_size, color, background_box, animation },
@@ -171,6 +196,10 @@ app.post("/render", async (req, res) => {
   const aPos = ["below_quote", "bottom"].includes(as.position) ? as.position : "below_quote";
   const aFont = FONTS.elegant;
 
+  // Безопасная рамка для текста (по центру кадра). По умолчанию 800x1500.
+  const safeW = clamp(b.safe_width, 300, width, 800);
+  const safeH = clamp(b.safe_height, 300, height, 1500);
+
   const dir = await mkdtemp(join(tmpdir(), "render-"));
   const imgPath = join(dir, "image.png");
   const musicPath = join(dir, "audio.mp3");
@@ -186,25 +215,31 @@ app.post("/render", async (req, res) => {
     const dur = Math.max(5, Math.min(maxSeconds, audioDur || maxSeconds));
     const totalFrames = Math.round(dur * fps);
 
-    // Перенос текста цитаты
-    const maxChars = Math.max(12, Math.floor((width * 0.9) / (qSize * 0.5)));
-    const lines = wrapText(quoteText, maxChars);
-    await writeFile(quoteFile, lines.join("\n"));
+    // --- Подгонка текста в безопасную рамку safeW x safeH (по центру кадра) ---
     const hasAuthor = author && author.length > 0;
+    const gapAfterQuote = 40;
+    const authorReserve = hasAuthor ? aSize + gapAfterQuote : 0;
+    const quoteAvailH = safeH - authorReserve;
+
+    // Автоматически переносим строки и уменьшаем кегль, пока цитата не влезет в рамку.
+    const fit = fitText(quoteText, qSize, 34, safeW, quoteAvailH);
+    const lineH = fit.lineH;
+    const quoteBlockH = fit.blockH;
+    const drawSize = fit.size;
+    await writeFile(quoteFile, fit.lines.join("\n"));
     if (hasAuthor) await writeFile(authorFile, "— " + author);
 
-    // Геометрия блока цитаты
-    const lineH = Math.round(qSize * 1.35);
-    const quoteBlockH = lines.length * lineH;
+    // Геометрия: верх рамки по центру кадра
+    const boxTop = Math.round((height - safeH) / 2);
     let quoteY;
-    if (qPos === "top") quoteY = 220;
-    else if (qPos === "bottom") quoteY = height - quoteBlockH - 340;
-    else quoteY = Math.round((height - quoteBlockH) / 2);
-    if (quoteY < 120) quoteY = 120;
+    if (qPos === "top") quoteY = boxTop + 20;
+    else if (qPos === "bottom") quoteY = boxTop + quoteAvailH - quoteBlockH;
+    else quoteY = boxTop + Math.round((quoteAvailH - quoteBlockH) / 2);
+    if (quoteY < boxTop) quoteY = boxTop;
 
     let authorY;
-    if (aPos === "bottom") authorY = height - aSize - 160;
-    else authorY = quoteY + quoteBlockH + 40;
+    if (aPos === "bottom") authorY = boxTop + safeH - aSize;
+    else authorY = quoteY + quoteBlockH + gapAfterQuote;
 
     // Подложка и анимация появления
     const boxOpt = qBox ? ":box=1:boxcolor=black@0.45:boxborderw=34" : "";
@@ -215,7 +250,7 @@ app.post("/render", async (req, res) => {
     const base = `scale=1620:2880:force_original_aspect_ratio=increase,crop=1620:2880`;
     const zp = buildZoompan(b.animation, totalFrames, fps);
     const drawQuote =
-      `drawtext=fontfile=${qFont}:textfile=${quoteFile}:fontcolor=${qColor}:fontsize=${qSize}` +
+      `drawtext=fontfile=${qFont}:textfile=${quoteFile}:fontcolor=${qColor}:fontsize=${drawSize}` +
       `:line_spacing=14:x=(w-text_w)/2:y=${quoteY}${boxOpt}${alphaOpt}`;
     const drawAuthor = hasAuthor
       ? `,drawtext=fontfile=${aFont}:textfile=${authorFile}:fontcolor=${aColor}:fontsize=${aSize}` +
